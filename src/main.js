@@ -12,23 +12,28 @@ function readJSON(filename) {
     return parsedJSON;
 }
 
-function cleanupOutput(resultsJSONFile, outputFormats) {
+async function cleanupOutput(resultsJSONFile, outputFormats) {
     if (!outputFormats.toLowerCase().includes('json') || outputFormats === '') {
-        io.rmRF(resultsJSONFile);
+        // the entrypoint copied the report into the action dir, KICS wrote the original into the workspace
+        const copies = new Set([filepath.resolve(resultsJSONFile), filepath.resolve(process.env.GITHUB_WORKSPACE || '', resultsJSONFile)]);
+        for (const copy of copies) {
+            await io.rmRF(copy);
+        }
     }
 }
 
-function processOutputPath(output) {
+function processOutputPath(output, outputName) {
+    const resultsFilename = outputName || "results";
     if (output === '') {
         return {
             path: "./",
-            resultsJSONFile: "./results.json"
+            resultsJSONFile: `./${resultsFilename}.json`
         }
     }
 
     return {
         path: output,
-        resultsJSONFile: filepath.join(output, "/results.json")
+        resultsJSONFile: filepath.join(output, `/${resultsFilename}.json`)
     }
 }
 
@@ -52,9 +57,12 @@ async function main() {
     let enableJobsSummary = process.env.INPUT_ENABLE_JOBS_SUMMARY;
     const commentsWithQueries = process.env.INPUT_COMMENTS_WITH_QUERIES;
     const excludedColumnsForCommentsWithQueries = process.env.INPUT_EXCLUDED_COLUMNS_FOR_COMMENTS_WITH_QUERIES.split(',');
-    const outputPath = processOutputPath(process.env.INPUT_OUTPUT_PATH);
+    const outputPath = processOutputPath(process.env.INPUT_OUTPUT_PATH, process.env.INPUT_OUTPUT_NAME);
     const outputFormats = process.env.INPUT_OUTPUT_FORMATS;
     const exitCode = process.env.KICS_EXIT_CODE
+
+    // the scan verdict comes first so a reporting failure can never hide it
+    setWorkflowStatus(exitCode);
 
     try {
         const octokit = github.getOctokit(githubToken);
@@ -76,19 +84,24 @@ async function main() {
         enableComments = enableComments ? enableComments : "false"
         enableJobsSummary = enableJobsSummary ? enableJobsSummary : "false"
 
-        const parsedResults = readJSON(outputPath.resultsJSONFile);
+        let parsedResults;
+        try {
+            parsedResults = readJSON(outputPath.resultsJSONFile);
+        } catch (e) {
+            core.setFailed(`Could not read the KICS results: ${e.message}`);
+            return;
+        }
         if (enableAnnotations.toLocaleLowerCase() === "true") {
             annotator.annotateChangesWithResults(parsedResults);
         }
-        if (enableComments.toLocaleLowerCase() === "true") {
+        if (enableComments.toLocaleLowerCase() === "true" && prNumber !== '') {
             await commenter.postPRComment(parsedResults, repo, prNumber, octokit, commentsWithQueries.toLocaleLowerCase() === "true", excludedColumnsForCommentsWithQueries);
         }
         if (enableJobsSummary.toLocaleLowerCase() === "true") {
             await commenter.postJobSummary(parsedResults, commentsWithQueries.toLocaleLowerCase() === "true", excludedColumnsForCommentsWithQueries);
         }
 
-        setWorkflowStatus(exitCode);
-        cleanupOutput(outputPath.resultsJSONFile, outputFormats);
+        await cleanupOutput(outputPath.resultsJSONFile, outputFormats);
     } catch (e) {
         console.error(e);
     }
